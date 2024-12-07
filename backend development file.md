@@ -16,35 +16,158 @@ app.include_router(api_router, prefix="/api/v1")
 ## Core Module
 ```python
 # backend/app/core/config.py
+from typing import Any, Dict, Optional
+from pydantic import PostgresDsn, validator
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
-    PROJECT_NAME: str = "Flashcard App"
-    DATABASE_URL: str = "postgresql+asyncpg://user:password@localhost/db"
-    JWT_SECRET: str = "your-secret-key"
-    ALGORITHM: str = "HS256"
+    PROJECT_NAME: str = "AI Flashcard App"
+    API_V1_STR: str = "/api/v1"
+    
+    # JWT Settings
+    JWT_SECRET: str
+    JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    
+    # Database Settings
+    POSTGRES_SERVER: str
+    POSTGRES_USER: str
+    POSTGRES_PASSWORD: str
+    POSTGRES_DB: str
+    SQLALCHEMY_DATABASE_URI: Optional[PostgresDsn] = None
+
+    # Gemini Settings
+    GOOGLE_API_KEY: str
+    GEMINI_MODEL: str = "gemini-pro"
+    GEMINI_TEMPERATURE: float = 0.7
+    GEMINI_MAX_OUTPUT_TOKENS: int = 2048
+    
+    # Redis Settings
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
+    
+    # File Upload Settings
+    MAX_UPLOAD_SIZE: int = 10 * 1024 * 1024  # 10MB
+    ALLOWED_UPLOAD_EXTENSIONS: set = {".pdf"}
+    
+    @validator("SQLALCHEMY_DATABASE_URI", pre=True)
+    def assemble_db_connection(cls, v: Optional[str], values: Dict[str, Any]) -> Any:
+        if isinstance(v, str):
+            return v
+        return PostgresDsn.build(
+            scheme="postgresql+asyncpg",
+            username=values.get("POSTGRES_USER"),
+            password=values.get("POSTGRES_PASSWORD"),
+            host=values.get("POSTGRES_SERVER"),
+            path=f"/{values.get('POSTGRES_DB') or ''}",
+        )
+
+    class Config:
+        case_sensitive = True
+        env_file = ".env"
 
 settings = Settings()
 
 # backend/app/core/security.py
 from datetime import datetime, timedelta
-from jose import jwt
+from typing import Optional, Union
+from jose import JWTError, jwt
 from passlib.context import CryptContext
+from app.core.config import settings
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# TODO: Implement password hashing and verification
-# TODO: Implement JWT token creation and validation
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify a plain password against a hashed password."""
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    """Generate a hash from a plain password."""
+    return pwd_context.hash(password)
+
+def create_token(
+    subject: Union[str, int],
+    expires_delta: Optional[timedelta] = None,
+    scopes: list[str] = None,
+    refresh: bool = False,
+) -> str:
+    """Create a JWT token with configurable expiration and scopes."""
+    if expires_delta is None:
+        expires_delta = (
+            timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+            if refresh
+            else timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+        )
+        
+    expire = datetime.utcnow() + expires_delta
+    to_encode = {
+        "exp": expire,
+        "sub": str(subject),
+        "type": "refresh" if refresh else "access"
+    }
+    if scopes:
+        to_encode["scopes"] = scopes
+        
+    return jwt.encode(
+        to_encode,
+        settings.JWT_SECRET,
+        algorithm=settings.JWT_ALGORITHM
+    )
+
+def verify_token(token: str) -> dict:
+    """Verify and decode a JWT token."""
+    try:
+        payload = jwt.decode(
+            token,
+            settings.JWT_SECRET,
+            algorithms=[settings.JWT_ALGORITHM]
+        )
+        return payload
+    except JWTError:
+        return None
 
 # backend/app/core/database.py
+from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, declarative_base
+from app.core.config import settings
 
-engine = create_async_engine(settings.DATABASE_URL)
-AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession)
+# Create async engine
+engine = create_async_engine(
+    str(settings.SQLALCHEMY_DATABASE_URI),
+    pool_pre_ping=True,
+    echo=False
+)
 
-# TODO: Implement database dependency for FastAPI
+# Create async session factory
+AsyncSessionLocal = sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+    autocommit=False,
+    autoflush=False,
+)
+
+# Create declarative base for models
+Base = declarative_base()
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """Dependency for getting async database sessions."""
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
+
+async def init_db() -> None:
+    """Initialize database by creating all tables."""
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 ```
 
 ## Models
@@ -122,65 +245,316 @@ class Flashcard(FlashcardBase):
     class Config:
         from_attributes = True
 ```
+## API Deps
+```python
+#backend/app/api/deps.py
+from typing import AsyncGenerator, Optional
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.database import get_db
+from app.core.security import verify_token
+from app.models.user import User
+from app.services.ai import gemini_service
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/v1/auth/login")
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db)
+) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    payload = verify_token(token)
+    if not payload:
+        raise credentials_exception
+        
+    user_id: str = payload.get("sub")
+    if not user_id:
+        raise credentials_exception
+        
+    user = await db.get(User, int(user_id))
+    if not user:
+        raise credentials_exception
+        
+    return user
+
+```
 
 ## API Endpoints
 ```python
 # backend/app/api/v1/endpoints/auth.py
-from fastapi import APIRouter, Depends
-from app.schemas.user import UserCreate, User
+from datetime import timedelta
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from app.core.database import get_db
+from app.core.security import verify_password, get_password_hash, create_token
+from app.models.user import User
+from app.schemas.user import UserCreate, UserResponse, TokenResponse
 
 router = APIRouter()
 
-@router.post("/signup", response_model=User)
-async def signup(user: UserCreate):
-    # TODO: Implement user registration
-    pass
+@router.post("/signup", response_model=UserResponse)
+async def signup(
+    user_data: UserCreate,
+    db: AsyncSession = Depends(get_db)
+):
+    # Check if user exists
+    result = await db.execute(select(User).where(User.email == user_data.email))
+    if result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+    
+    # Create new user
+    db_user = User(
+        email=user_data.email,
+        hashed_password=get_password_hash(user_data.password),
+    )
+    db.add(db_user)
+    await db.commit()
+    await db.refresh(db_user)
+    
+    return db_user
 
-@router.post("/login")
-async def login():
-    # TODO: Implement user login
-    pass
+@router.post("/login", response_model=TokenResponse)
+async def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: AsyncSession = Depends(get_db)
+):
+    # Authenticate user
+    result = await db.execute(
+        select(User).where(User.email == form_data.username)
+    )
+    user = result.scalar_one_or_none()
+    
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # Create access and refresh tokens
+    access_token = create_token(subject=user.id)
+    refresh_token = create_token(
+        subject=user.id,
+        expires_delta=timedelta(days=7),
+        refresh=True
+    )
+    
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer"
+    }
 
 # backend/app/api/v1/endpoints/flashcards.py
-from fastapi import APIRouter, Depends
-from app.schemas.flashcard import FlashcardCreate, Flashcard
+from typing import List
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from app.api.deps import get_current_user
+from app.core.database import get_db
+from app.models.flashcard import Flashcard
+from app.models.user import User
+from app.schemas.flashcard import FlashcardCreate, FlashcardResponse
+from app.services.ai import gemini_service
 
 router = APIRouter()
 
-@router.post("/", response_model=Flashcard)
-async def create_flashcard(flashcard: FlashcardCreate):
-    # TODO: Implement flashcard creation
-    pass
+@router.post("/", response_model=FlashcardResponse)
+async def create_flashcard(
+    flashcard: FlashcardCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # Create new flashcard
+    db_flashcard = Flashcard(
+        question=flashcard.question,
+        answer=flashcard.answer,
+        user_id=current_user.id
+    )
+    
+    # Optionally enhance the answer using AI
+    if flashcard.enhance_answer:
+        enhanced_answer = await gemini_service.enhance_answer(
+            flashcard.question,
+            flashcard.answer
+        )
+        db_flashcard.answer = enhanced_answer
+    
+    db.add(db_flashcard)
+    await db.commit()
+    await db.refresh(db_flashcard)
+    
+    return db_flashcard
 
-@router.get("/{flashcard_id}", response_model=Flashcard)
-async def get_flashcard(flashcard_id: int):
-    # TODO: Implement get flashcard
-    pass
+@router.get("/", response_model=List[FlashcardResponse])
+async def get_flashcards(
+    skip: int = 0,
+    limit: int = 100,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(
+        select(Flashcard)
+        .where(Flashcard.user_id == current_user.id)
+        .offset(skip)
+        .limit(limit)
+    )
+    return result.scalars().all()
+
+@router.get("/{flashcard_id}", response_model=FlashcardResponse)
+async def get_flashcard(
+    flashcard_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(
+        select(Flashcard)
+        .where(
+            Flashcard.id == flashcard_id,
+            Flashcard.user_id == current_user.id
+        )
+    )
+    flashcard = result.scalar_one_or_none()
+    
+    if not flashcard:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Flashcard not found"
+        )
+    
+    return flashcard
+
 
 # backend/app/api/v1/endpoints/pdf.py
-from fastapi import APIRouter, UploadFile
+from fastapi import APIRouter, Depends, File, UploadFile, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.api.deps import get_current_user
+from app.core.database import get_db
+from app.core.config import settings
+from app.models.user import User
+from app.services.pdf import extract_text_from_pdf
+from app.services.ai import gemini_service
 
 router = APIRouter()
 
 @router.post("/upload")
-async def upload_pdf(file: UploadFile):
-    # TODO: Implement PDF upload and processing
-    pass
+async def upload_pdf(
+    file: UploadFile = File(...),
+    num_cards: int = 5,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # Validate file size and type
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF files are allowed"
+        )
+    
+    content = await file.read()
+    if len(content) > settings.MAX_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File size exceeds {settings.MAX_UPLOAD_SIZE // 1024 // 1024}MB limit"
+        )
+    
+    # Extract text from PDF
+    text = await extract_text_from_pdf(content)
+    
+    # Generate flashcards using AI
+    flashcards = await gemini_service.generate_flashcards(text, num_cards)
+    
+    # Store flashcards in database
+    db_flashcards = []
+    for card in flashcards:
+        db_flashcard = Flashcard(
+            question=card.question,
+            answer=card.answer,
+            user_id=current_user.id
+        )
+        db.add(db_flashcard)
+        db_flashcards.append(db_flashcard)
+    
+    await db.commit()
+    
+    # Generate study tips
+    study_tips = await gemini_service.generate_study_tips(flashcards)
+    
+    return {
+        "flashcards": db_flashcards,
+        "study_tips": study_tips
+    }
+
+
 
 # backend/app/api/v1/endpoints/study.py
-from fastapi import APIRouter
+from datetime import datetime
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from app.api.deps import get_current_user
+from app.core.database import get_db
+from app.models.study_session import StudySession
+from app.models.user import User
+from app.schemas.study import StudySessionResponse
 
 router = APIRouter()
 
-@router.post("/start")
-async def start_session():
-    # TODO: Implement study session start
-    pass
+@router.post("/start", response_model=StudySessionResponse)
+async def start_session(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # Create new study session
+    session = StudySession(
+        user_id=current_user.id,
+        start_time=datetime.utcnow()
+    )
+    db.add(session)
+    await db.commit()
+    await db.refresh(session)
+    
+    return session
 
-@router.post("/end")
-async def end_session():
-    # TODO: Implement study session end
-    pass
+@router.post("/end/{session_id}", response_model=StudySessionResponse)
+async def end_session(
+    session_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # Get and update study session
+    result = await db.execute(
+        select(StudySession)
+        .where(
+            StudySession.id == session_id,
+            StudySession.user_id == current_user.id
+        )
+    )
+    session = result.scalar_one_or_none()
+    
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Study session not found"
+        )
+    
+    session.end_time = datetime.utcnow()
+    await db.commit()
+    await db.refresh(session)
+    
+    return session
+
 
 # backend/app/api/v1/router.py
 from fastapi import APIRouter
